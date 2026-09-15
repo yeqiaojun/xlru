@@ -1,147 +1,124 @@
 package xlru
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
-	"sync/atomic"
+	"log/slog"
+	"reflect"
+	"strconv"
 	"time"
-
-	"github.com/phuslu/lru"
 
 	"golang.org/x/sync/singleflight"
 )
 
-var ErrorCacheEntryNotFound = fmt.Errorf("cache entry not found")
+var ErrorCacheEntryNotFound = errors.New("cache entry not found")
 
 type LruKey interface {
 	~string | ~int64
 }
 
-// DataAccessor is a generic interface for data access operations.
-// The save method is intended to persist the data.
+// DataAccessor reports whether a value needs persistence.
 type DataAccessor interface {
-	NeedSave() bool //本对象为nil也要返回false
+	NeedSave() bool // Must be safe to call concurrently; callbacks own value synchronization.
 }
 
 // Option holds configuration for the XLRUCache.
 // It is generic over the key type K and the value type V.
 type Option[K LruKey, V DataAccessor] struct {
-	TTL            time.Duration // cache item ttl, nanoseconds
+	TTL            time.Duration // Zero defaults to 24 hours; negative disables expiration.
 	Sliding        bool          // cache item sliding
 	Logger         Logger
 	OnLoader       func(key K) (V, error)
 	OnEvict        func(value V) error
-	OnBatchSaver   func(value []V) error //批量save中，必须修改value 的 NeedSave返回值
+	OnBatchSaver   func(value []V) error // The saver owns clearing dirty state after successful persistence.
 	BatchSaveCount int
 }
 
-// XLRUCache is a generic LRU cache with TTL support.
+// XLRUCache is a sharded SIEVE cache with TTL and optional persistence.
+// Options are copied at construction and remain private.
 type XLRUCache[K LruKey, V DataAccessor] struct {
-	Data  *lru.TTLCache[K, V]
-	Opt   Option[K, V]
-	group *singleflight.Group
-	Size  int
-	index int32
+	data  *store[K, V]
+	opt   Option[K, V]
+	group singleflight.Group
 }
 
 // NewXLRUCache creates a new XLRUCache with the given options.
 func NewXLRUCache[K LruKey, V DataAccessor](size int, opt Option[K, V]) *XLRUCache[K, V] {
-	cache := lru.NewTTLCache(
-		size,
-		lru.WithSliding[K, V](opt.Sliding),
-	)
-
-	if opt.TTL == 0 {
-		opt.TTL = time.Hour * 24
+	if opt.BatchSaveCount < 0 {
+		panic("xlru: BatchSaveCount must not be negative")
 	}
-
-	if opt.BatchSaveCount == 0 && opt.OnBatchSaver != nil {
-		opt.BatchSaveCount = 1000
+	if opt.Logger == nil {
+		opt.Logger = slog.Default()
 	}
+	opt.TTL = cmp.Or(opt.TTL, 24*time.Hour)
+	opt.BatchSaveCount = cmp.Or(opt.BatchSaveCount, 1000)
+	cache := newStore[K, V](size, opt.Sliding)
 
 	return &XLRUCache[K, V]{
-		Data:  cache,
-		Opt:   opt,
-		Size:  size,
-		group: &singleflight.Group{},
+		data: cache,
+		opt:  opt,
 	}
 }
 
-// Get retrieves a value from the cache for the given key.
-// If the value is not found, it loads it from the Load function and saves it to the cache.
-func (c *XLRUCache[K, V]) Get(key K) (v V, err error) {
-	v, state := c.Data.GetWithState(key)
-	if state == lru.TTLStateHit {
-		return v, nil
-	}
-
-	return c.Load(key)
+// Peek returns a live value without touching the visited bit or sliding TTL.
+func (c *XLRUCache[K, V]) Peek(key K) (V, bool) {
+	return c.data.peek(key, false)
 }
 
-// Peek retrieves a value from the cache for the given key without updating the LRU order.
-func (c *XLRUCache[K, V]) Peek(key K) (v V, ok bool) {
-	v, _, ok = c.Data.Peek(key)
-	return
-}
-
-// Load loads a value for the given key from the data source. store load value to cache
-func (c *XLRUCache[K, V]) Load(key K) (v V, err error) {
-	if c.Opt.OnLoader == nil {
-		return v, ErrorCacheEntryNotFound
+// Load coalesces concurrent loads of the same key and rechecks the cache first.
+func (c *XLRUCache[K, V]) Load(key K) (value V, err error) {
+	if c.opt.OnLoader == nil {
+		return value, ErrorCacheEntryNotFound
 	}
-
-	nv, err, _ := c.group.Do(fmt.Sprintf("%v", key), func() (interface{}, error) {
-		if v, state := c.Data.GetWithState(key); state == lru.TTLStateHit {
-			return v, nil
-		} else if state == lru.TTLStateExpired {
-			if err := c.persistExpiredEntry(key, v); err != nil {
-				return nil, err
-			}
+	// Read the underlying value so named keys with String methods cannot collide.
+	keyValue := reflect.ValueOf(key)
+	var loadKey string
+	if keyValue.Kind() == reflect.String {
+		loadKey = keyValue.String()
+	} else {
+		loadKey = strconv.FormatInt(keyValue.Int(), 10)
+	}
+	loaded, err, _ := c.group.Do(loadKey, func() (any, error) {
+		value, err := c.get(key, false)
+		if err == nil {
+			return value, nil
 		}
-
-		if v, state := c.Data.GetWithState(key); state == lru.TTLStateHit {
-			return v, nil
-		}
-
-		v, err := c.Opt.OnLoader(key)
+		value, err = c.opt.OnLoader(key)
 		if err != nil {
 			return nil, err
 		}
-		if err := c.Set(key, v); err != nil {
-			return nil, err
-		}
-		return v, nil
+		_ = c.Set(key, value)
+		return value, nil
 	})
-
-	v, _ = nv.(V)
-	return v, err
-}
-
-func (c *XLRUCache[K, V]) persistExpiredEntry(key K, value V) error {
-	err := c.onEvict(value, "Expired Save Error")
-	c.Data.Delete(key)
-	return err
-}
-
-// Set sets a value in the cache for the given key.
-func (c *XLRUCache[K, V]) Set(key K, value V) error {
-	prev, rep := c.Data.Set(key, value, c.Opt.TTL)
-	if !rep {
-		return c.onEvict(prev, "Set Error")
+	if err != nil {
+		return value, err
 	}
+	return loaded.(V), nil
+}
 
+// Set installs value before saving a displaced dirty value. Save errors do not roll back the write.
+func (c *XLRUCache[K, V]) Set(key K, value V) error {
+	if old, displaced := c.data.set(key, value, c.opt.TTL); displaced {
+		return c.onEvict(old, "displaced")
+	}
 	return nil
 }
+
+// Delete removes a value before saving it. Save errors do not restore the entry.
 func (c *XLRUCache[K, V]) Delete(key K) error {
-	prev := c.Data.Delete(key)
-	return c.onEvict(prev, "Remove Error")
+	if value, removed := c.data.delete(key); removed {
+		return c.onEvict(value, "delete")
+	}
+	return nil
 }
 
 func (c *XLRUCache[K, V]) onEvict(value V, action string) error {
-	if !value.NeedSave() || c.Opt.OnEvict == nil {
+	if c.opt.OnEvict == nil || !value.NeedSave() {
 		return nil
 	}
 
-	err := c.Opt.OnEvict(value)
+	err := c.opt.OnEvict(value)
 	if err != nil {
 		c.logError("xlru on evict failed", "action", action, "error", err)
 		return fmt.Errorf("XLRUCache %s %w", action, err)
@@ -150,44 +127,30 @@ func (c *XLRUCache[K, V]) onEvict(value V, action string) error {
 }
 
 func (c *XLRUCache[K, V]) Len() int {
-	return c.Data.Len()
+	return int(c.data.stats().EntriesCount)
 }
 
-func (c *XLRUCache[K, V]) Stats() lru.Stats {
-	return c.Data.Stats()
+func (c *XLRUCache[K, V]) Stats() Stats {
+	return c.data.stats()
 }
 
+// Capacity returns the configured total capacity across all shards.
+func (c *XLRUCache[K, V]) Capacity() int { return c.data.capacity }
+
+// BatchSave advances through at most ten batches of resident slots per call.
+// This bounds scanning work even when the cache contains mostly clean values.
 func (c *XLRUCache[K, V]) BatchSave() {
-	if c.Opt.OnBatchSaver == nil {
+	if c.opt.OnBatchSaver == nil {
 		return
 	}
-	keys := make([]K, 0, c.Size)
-	keys = c.Data.AppendAllKeys(keys)
-
-	// 如果keys数量较少，直接调用SaveAll
-	if len(keys) <= 10*c.Opt.BatchSaveCount {
+	limit := c.data.capacity
+	if c.opt.BatchSaveCount <= limit/10 {
+		limit = c.opt.BatchSaveCount * 10
+	}
+	keys := c.data.batchKeys(limit)
+	if len(keys) != 0 {
 		c.FlushToDB(keys)
-		return
 	}
-
-	batchCount := c.Size / (10 * c.Opt.BatchSaveCount)
-	index := int(atomic.AddInt32(&c.index, 1) % int32(batchCount))
-
-	batchSize := (len(keys) + batchCount - 1) / batchCount
-	start := index * batchSize
-	end := start + batchSize
-
-	if start >= len(keys) {
-		start = 0
-		end = batchSize
-	}
-
-	if end > len(keys) {
-		end = len(keys)
-	}
-
-	batchKeys := keys[start:end]
-	c.FlushToDB(batchKeys)
 }
 
 // FlushToDB saves all values in the cache.
@@ -199,7 +162,7 @@ func (c *XLRUCache[K, V]) FlushToDB(saveKeys []K) {
 
 // FlushToDBWithErr saves all values in the cache and returns the first error (if any).
 func (c *XLRUCache[K, V]) FlushToDBWithErr(saveKeys []K) error {
-	if c.Opt.OnBatchSaver == nil {
+	if c.opt.OnBatchSaver == nil {
 		c.logError("xlru batch save skipped", "reason", "OnBatchSaver is nil")
 		return nil
 	}
@@ -207,13 +170,13 @@ func (c *XLRUCache[K, V]) FlushToDBWithErr(saveKeys []K) error {
 	var firstErr error
 	keys := saveKeys
 	if len(saveKeys) == 0 {
-		keys = make([]K, 0, c.Size)
-		keys = c.Data.AppendAllKeys(keys)
+		keys = make([]K, 0, c.data.capacity)
+		keys = c.data.appendKeys(keys)
 	}
 
-	needSave := make([]V, 0, c.Opt.BatchSaveCount)
+	needSave := make([]V, 0, min(c.opt.BatchSaveCount, len(keys)))
 	for _, k := range keys {
-		v, _, ok := c.Data.Peek(k)
+		v, ok := c.data.peek(k, true)
 		if !ok {
 			continue
 		}
@@ -222,16 +185,16 @@ func (c *XLRUCache[K, V]) FlushToDBWithErr(saveKeys []K) error {
 			needSave = append(needSave, v)
 		}
 
-		if len(needSave) >= c.Opt.BatchSaveCount {
-			if err := c.Opt.OnBatchSaver(needSave); err != nil && firstErr == nil {
+		if len(needSave) >= c.opt.BatchSaveCount {
+			if err := c.opt.OnBatchSaver(needSave); err != nil && firstErr == nil {
 				firstErr = err
 			}
-			needSave = make([]V, 0, c.Opt.BatchSaveCount)
+			needSave = make([]V, 0, min(c.opt.BatchSaveCount, len(keys)))
 		}
 	}
 
 	if len(needSave) > 0 {
-		if err := c.Opt.OnBatchSaver(needSave); err != nil && firstErr == nil {
+		if err := c.opt.OnBatchSaver(needSave); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -240,8 +203,30 @@ func (c *XLRUCache[K, V]) FlushToDBWithErr(saveKeys []K) error {
 }
 
 func (c *XLRUCache[K, V]) logError(msg string, args ...any) {
-	if c.Opt.Logger == nil {
-		return
+	c.opt.Logger.Error(msg, args...)
+}
+
+// EvictReport describes progress even when saving a removed value fails.
+type EvictReport struct {
+	Scanned      int
+	Evicted      int
+	DirtyEvicted int
+}
+
+// EvictExpired checks at most scanLimit physical slots, including empty slots.
+// It saves removed dirty values after releasing all cache locks. Nonpositive limits are a no-op.
+func (c *XLRUCache[K, V]) EvictExpired(scanLimit int) (EvictReport, error) {
+	values, scanned := c.data.takeExpired(scanLimit)
+	report := EvictReport{Scanned: scanned, Evicted: len(values)}
+	var firstErr error
+	for _, value := range values {
+		if !value.NeedSave() {
+			continue
+		}
+		report.DirtyEvicted++
+		if err := c.onEvict(value, "expired_scan"); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	c.Opt.Logger.Error(msg, args...)
+	return report, firstErr
 }

@@ -1,60 +1,41 @@
 package xlru
 
-import (
-	"time"
-)
+import "time"
 
-type LocalCacheDataHelper[T any] struct {
-	data T
-}
+// localValue keeps ordinary values in the node itself, without allocating a wrapper per entry.
+type localValue[V any] struct{ data V }
 
-func (d *LocalCacheDataHelper[T]) Data() T {
-	return d.data
-}
-func (d *LocalCacheDataHelper[T]) NeedSave() bool {
-	return false
-}
-func (d *LocalCacheDataHelper[T]) SetNeedSave(needs bool) {
+func (localValue[V]) NeedSave() bool { return false }
 
-}
+// LocalCache provides the same storage and expiration policy for values without persistence.
+type LocalCache[K LruKey, V any] struct{ cache *XLRUCache[K, localValue[V]] }
 
-type LocalCache[K LruKey, V any] struct {
-	*XLRUCache[K, *LocalCacheDataHelper[V]]
-}
-
-func NewLocalCache[K LruKey, V any](size int, Sliding bool, TTL time.Duration, loader func(key K) (V, error)) *LocalCache[K, V] {
-
-	xloader := func(key K) (*LocalCacheDataHelper[V], error) {
-		v, err := loader(key)
-		return &LocalCacheDataHelper[V]{data: v}, err
+func NewLocalCache[K LruKey, V any](size int, sliding bool, ttl time.Duration, loader func(K) (V, error)) *LocalCache[K, V] {
+	opt := Option[K, localValue[V]]{TTL: ttl, Sliding: sliding}
+	if loader != nil {
+		opt.OnLoader = func(key K) (localValue[V], error) {
+			value, err := loader(key)
+			return localValue[V]{data: value}, err
+		}
 	}
-
-	opt := Option[K, *LocalCacheDataHelper[V]]{
-		TTL:      TTL,
-		OnLoader: xloader,
-		Sliding:  Sliding,
-	}
-
-	XLRUCache := NewXLRUCache(size, opt)
-	return &LocalCache[K, V]{
-		XLRUCache,
-	}
+	return &LocalCache[K, V]{cache: NewXLRUCache(size, opt)}
 }
 
 func (c *LocalCache[K, V]) Get(key K) (V, error) {
-	v, err := c.XLRUCache.Get(key)
-	return v.Data(), err
+	value, err := c.cache.Get(key)
+	return value.data, err
 }
-
+func (c *LocalCache[K, V]) Peek(key K) (V, bool) {
+	value, ok := c.cache.Peek(key)
+	return value.data, ok
+}
 func (c *LocalCache[K, V]) Set(key K, value V) error {
-	return c.XLRUCache.Set(key, &LocalCacheDataHelper[V]{
-		data: value,
-	})
+	return c.cache.Set(key, localValue[V]{data: value})
 }
-
-func (c *LocalCache[K, V]) Delete(key K) error {
-	return c.XLRUCache.Delete(key)
-}
-func (c *LocalCache[K, V]) Len() int {
-	return c.XLRUCache.Len()
+func (c *LocalCache[K, V]) Delete(key K) error { return c.cache.Delete(key) }
+func (c *LocalCache[K, V]) Len() int           { return c.cache.Len() }
+func (c *LocalCache[K, V]) Capacity() int      { return c.cache.Capacity() }
+func (c *LocalCache[K, V]) Stats() Stats       { return c.cache.Stats() }
+func (c *LocalCache[K, V]) EvictExpired(limit int) (EvictReport, error) {
+	return c.cache.EvictExpired(limit)
 }

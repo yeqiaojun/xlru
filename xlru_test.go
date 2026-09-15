@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -97,7 +98,7 @@ func newMongoCollection(t *testing.T, dbName string) (*mongo.Client, *mongo.Coll
 		uri = "mongodb://localhost:27017"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	client, err := mongo.Connect(options.Client().ApplyURI(uri))
@@ -130,13 +131,13 @@ func TestNewXLRUCache(t *testing.T) {
 	}
 	cache := NewXLRUCache(100, opt)
 
-	if cache.Size != 100 {
-		t.Errorf("expected size 100, got %d", cache.Size)
+	if cache.Capacity() != 100 {
+		t.Errorf("expected size 100, got %d", cache.Capacity())
 	}
-	if cache.Opt.TTL != time.Minute {
-		t.Errorf("expected TTL %v, got %v", time.Minute, cache.Opt.TTL)
+	if cache.opt.TTL != time.Minute {
+		t.Errorf("expected TTL %v, got %v", time.Minute, cache.opt.TTL)
 	}
-	if !cache.Opt.Sliding {
+	if !cache.opt.Sliding {
 		t.Errorf("expected Sliding to be true")
 	}
 }
@@ -146,19 +147,19 @@ func TestNewXLRUCache_Defaults(t *testing.T) {
 		OnBatchSaver: func(values []*MockDataAccessor) error { return nil },
 	})
 
-	if cache.Opt.TTL != 24*time.Hour {
-		t.Fatalf("expected default TTL 24h, got %v", cache.Opt.TTL)
+	if cache.opt.TTL != 24*time.Hour {
+		t.Fatalf("expected default TTL 24h, got %v", cache.opt.TTL)
 	}
-	if cache.Opt.BatchSaveCount != 1000 {
-		t.Fatalf("expected default BatchSaveCount 1000, got %d", cache.Opt.BatchSaveCount)
+	if cache.opt.BatchSaveCount != 1000 {
+		t.Fatalf("expected default BatchSaveCount 1000, got %d", cache.opt.BatchSaveCount)
 	}
 }
 
 func TestXLRUCache_Get_Set(t *testing.T) {
-	var loaderCount int32
+	var loaderCount atomic.Int32
 	opt := Option[string, *MockDataAccessor]{
 		OnLoader: func(key string) (*MockDataAccessor, error) {
-			atomic.AddInt32(&loaderCount, 1)
+			loaderCount.Add(1)
 			id, _ := strconv.Atoi(key)
 			return &MockDataAccessor{ID: id, Data: "loaded-" + key}, nil
 		},
@@ -173,8 +174,8 @@ func TestXLRUCache_Get_Set(t *testing.T) {
 	if v.Data != "loaded-1" {
 		t.Errorf("expected data 'loaded-1', got '%s'", v.Data)
 	}
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Errorf("expected loader to be called once, got %d", loaderCount)
+	if loaderCount.Load() != 1 {
+		t.Errorf("expected loader to be called once, got %d", loaderCount.Load())
 	}
 
 	// Test Get again, should not call loader
@@ -182,8 +183,8 @@ func TestXLRUCache_Get_Set(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Errorf("expected loader to be called once, got %d", loaderCount)
+	if loaderCount.Load() != 1 {
+		t.Errorf("expected loader to be called once, got %d", loaderCount.Load())
 	}
 
 	// Test Set
@@ -196,8 +197,8 @@ func TestXLRUCache_Get_Set(t *testing.T) {
 		t.Errorf("expected data 'set-2', got '%s'", v.Data)
 	}
 	// Loader should not be called for key "2"
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Errorf("expected loader to be called once, got %d", loaderCount)
+	if loaderCount.Load() != 1 {
+		t.Errorf("expected loader to be called once, got %d", loaderCount.Load())
 	}
 }
 
@@ -230,7 +231,7 @@ func TestXLRUCache_OnEvictCalledOnEviction(t *testing.T) {
 		return len(evicted) > 0
 	}
 
-	for i := 0; i < maxInsertions; i++ {
+	for i := range maxInsertions {
 		mustSet(i)
 	}
 
@@ -242,168 +243,175 @@ func TestXLRUCache_OnEvictCalledOnEviction(t *testing.T) {
 }
 
 func TestXLRUCache_SingleFlight(t *testing.T) {
-	var loaderCount int32
-	opt := Option[string, *MockDataAccessor]{
-		OnLoader: func(key string) (*MockDataAccessor, error) {
-			atomic.AddInt32(&loaderCount, 1)
-			time.Sleep(100 * time.Millisecond) // Simulate work
-			return &MockDataAccessor{Data: "loaded-" + key}, nil
-		},
-	}
-	cache := NewXLRUCache(10, opt)
+	synctest.Test(t, func(t *testing.T) {
+		var loaderCount atomic.Int32
+		opt := Option[string, *MockDataAccessor]{
+			OnLoader: func(key string) (*MockDataAccessor, error) {
+				loaderCount.Add(1)
+				time.Sleep(100 * time.Millisecond) // Simulate work
+				return &MockDataAccessor{Data: "loaded-" + key}, nil
+			},
+		}
+		cache := NewXLRUCache(10, opt)
 
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			v, err := cache.Get("1")
-			if err != nil {
-				t.Errorf("expected no error, got %v", err)
-			}
-			if v.Data != "loaded-1" {
-				t.Errorf("expected data 'loaded-1', got '%s'", v.Data)
-			}
-		}()
-	}
-	wg.Wait()
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Go(func() {
+				v, err := cache.Get("1")
+				if err != nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+				if v.Data != "loaded-1" {
+					t.Errorf("expected data 'loaded-1', got '%s'", v.Data)
+				}
+			})
+		}
+		wg.Wait()
 
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Errorf("expected loader to be called once, got %d", loaderCount)
-	}
+		if loaderCount.Load() != 1 {
+			t.Errorf("expected loader to be called once, got %d", loaderCount.Load())
+		}
+	})
 }
 
 func TestXLRUCache_TTL(t *testing.T) {
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-	}
-	cache := NewXLRUCache(10, opt)
+	synctest.Test(t, func(t *testing.T) {
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+		}
+		cache := NewXLRUCache(10, opt)
 
-	cache.Set("1", &MockDataAccessor{Data: "test"})
-	_, ok := cache.Data.Get("1")
-	if !ok {
-		t.Fatalf("expected key 1 to be in cache %d", cache.Len())
-	}
-	time.Sleep(1100 * time.Millisecond)
-	_, ok = cache.Data.Get("1")
-	if ok {
-		t.Fatal("expected key 1 to be expired")
-	}
+		cache.Set("1", &MockDataAccessor{Data: "test"})
+		_, ok := cache.Peek("1")
+		if !ok {
+			t.Fatalf("expected key 1 to be in cache %d", cache.Len())
+		}
+		time.Sleep(1100 * time.Millisecond)
+		_, ok = cache.Peek("1")
+		if ok {
+			t.Fatal("expected key 1 to be expired")
+		}
+	})
 }
 
 func TestXLRUCache_GetExpiredDirty(t *testing.T) {
-	var loaderCount int32
-	var evicted []*MockDataAccessor
+	synctest.Test(t, func(t *testing.T) {
+		var loaderCount atomic.Int32
+		var evicted []*MockDataAccessor
 
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-		OnLoader: func(key string) (*MockDataAccessor, error) {
-			atomic.AddInt32(&loaderCount, 1)
-			return &MockDataAccessor{ID: 2, Data: "reloaded-" + key}, nil
-		},
-		OnEvict: func(value *MockDataAccessor) error {
-			evicted = append(evicted, value)
-			value.needSave = false
-			return nil
-		},
-	}
-	cache := NewXLRUCache(10, opt)
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+			OnLoader: func(key string) (*MockDataAccessor, error) {
+				loaderCount.Add(1)
+				return &MockDataAccessor{ID: 2, Data: "reloaded-" + key}, nil
+			},
+			OnEvict: func(value *MockDataAccessor) error {
+				evicted = append(evicted, value)
+				value.needSave = false
+				return nil
+			},
+		}
+		cache := NewXLRUCache(10, opt)
 
-	if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
+		if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
 
-	time.Sleep(1100 * time.Millisecond)
+		time.Sleep(1100 * time.Millisecond)
 
-	v, err := cache.Get("1")
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if v.Data != "reloaded-1" {
-		t.Fatalf("expected reloaded value, got %s", v.Data)
-	}
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Fatalf("expected loader to be called once, got %d", loaderCount)
-	}
-	if len(evicted) != 1 {
-		t.Fatalf("expected OnEvict to be called once, got %d", len(evicted))
-	}
-	if evicted[0].Data != "dirty-1" {
-		t.Fatalf("expected evicted value dirty-1, got %s", evicted[0].Data)
-	}
+		v, err := cache.Get("1")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if v.Data != "reloaded-1" {
+			t.Fatalf("expected reloaded value, got %s", v.Data)
+		}
+		if loaderCount.Load() != 1 {
+			t.Fatalf("expected loader to be called once, got %d", loaderCount.Load())
+		}
+		if len(evicted) != 1 {
+			t.Fatalf("expected OnEvict to be called once, got %d", len(evicted))
+		}
+		if evicted[0].Data != "dirty-1" {
+			t.Fatalf("expected evicted value dirty-1, got %s", evicted[0].Data)
+		}
+	})
 }
 
 func TestXLRUCache_GetExpiredDirtyOnEvictError(t *testing.T) {
-	var loaderCount int32
-	evictErr := errors.New("save failed")
+	synctest.Test(t, func(t *testing.T) {
+		var loaderCount atomic.Int32
+		evictErr := errors.New("save failed")
 
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-		OnLoader: func(key string) (*MockDataAccessor, error) {
-			atomic.AddInt32(&loaderCount, 1)
-			return &MockDataAccessor{ID: 2, Data: "reloaded-" + key}, nil
-		},
-		OnEvict: func(value *MockDataAccessor) error {
-			return evictErr
-		},
-	}
-	cache := NewXLRUCache(10, opt)
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+			OnLoader: func(key string) (*MockDataAccessor, error) {
+				loaderCount.Add(1)
+				return &MockDataAccessor{ID: 2, Data: "reloaded-" + key}, nil
+			},
+			OnEvict: func(value *MockDataAccessor) error {
+				return evictErr
+			},
+		}
+		cache := NewXLRUCache(10, opt)
 
-	if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
+		if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
 
-	time.Sleep(1100 * time.Millisecond)
+		time.Sleep(1100 * time.Millisecond)
 
-	_, err := cache.Get("1")
-	if !errors.Is(err, evictErr) {
-		t.Fatalf("expected evict err, got %v", err)
-	}
-	if atomic.LoadInt32(&loaderCount) != 0 {
-		t.Fatalf("expected loader not to run, got %d", loaderCount)
-	}
-
-	if _, _, ok := cache.Data.Peek("1"); ok {
-		t.Fatal("expected expired dirty entry to be removed after evict failure")
-	}
+		v, err := cache.Get("1")
+		if err != nil || v.Data != "reloaded-1" {
+			t.Fatalf("expected reload despite save failure, got %v, %v", v, err)
+		}
+		if loaderCount.Load() != 1 {
+			t.Fatalf("expected one reload, got %d", loaderCount.Load())
+		}
+		if current, ok := cache.Peek("1"); !ok || current != v {
+			t.Fatal("expected loaded value to remain resident")
+		}
+	})
 }
 
 func TestXLRUCache_GetExpiredClean(t *testing.T) {
-	var loaderCount int32
-	var evictCount int32
+	synctest.Test(t, func(t *testing.T) {
+		var loaderCount atomic.Int32
+		var evictCount atomic.Int32
 
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-		OnLoader: func(key string) (*MockDataAccessor, error) {
-			atomic.AddInt32(&loaderCount, 1)
-			return &MockDataAccessor{ID: 2, Data: "reloaded-" + key}, nil
-		},
-		OnEvict: func(value *MockDataAccessor) error {
-			atomic.AddInt32(&evictCount, 1)
-			return nil
-		},
-	}
-	cache := NewXLRUCache(10, opt)
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+			OnLoader: func(key string) (*MockDataAccessor, error) {
+				loaderCount.Add(1)
+				return &MockDataAccessor{ID: 2, Data: "reloaded-" + key}, nil
+			},
+			OnEvict: func(value *MockDataAccessor) error {
+				evictCount.Add(1)
+				return nil
+			},
+		}
+		cache := NewXLRUCache(10, opt)
 
-	if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "clean-1", needSave: false}); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
+		if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "clean-1", needSave: false}); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
 
-	time.Sleep(1100 * time.Millisecond)
+		time.Sleep(1100 * time.Millisecond)
 
-	v, err := cache.Get("1")
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if v.Data != "reloaded-1" {
-		t.Fatalf("expected reloaded value, got %s", v.Data)
-	}
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Fatalf("expected loader to be called once, got %d", loaderCount)
-	}
-	if atomic.LoadInt32(&evictCount) != 0 {
-		t.Fatalf("expected OnEvict not to be called, got %d", evictCount)
-	}
+		v, err := cache.Get("1")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if v.Data != "reloaded-1" {
+			t.Fatalf("expected reloaded value, got %s", v.Data)
+		}
+		if loaderCount.Load() != 1 {
+			t.Fatalf("expected loader to be called once, got %d", loaderCount.Load())
+		}
+		if evictCount.Load() != 0 {
+			t.Fatalf("expected OnEvict not to be called, got %d", evictCount.Load())
+		}
+	})
 }
 
 var errNotFound = errors.New("not found")
@@ -419,7 +427,7 @@ func TestXLRUCache_SetEviction(t *testing.T) {
 	cache := NewXLRUCache(16, opt)
 
 	var insertedKey string
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		insertedKey = fmt.Sprintf("key-%d", i)
 		err := cache.Set(insertedKey, &MockDataAccessor{Data: insertedKey, needSave: true})
 		if err != nil {
@@ -433,10 +441,10 @@ func TestXLRUCache_SetEviction(t *testing.T) {
 	if evictedKey == "" {
 		t.Fatal("expected an eviction to happen")
 	}
-	if _, _, ok := cache.Data.Peek(evictedKey); ok {
+	if _, ok := cache.Peek(evictedKey); ok {
 		t.Fatalf("expected evicted key %s to be removed", evictedKey)
 	}
-	if v, _, ok := cache.Data.Peek(insertedKey); !ok || v.Data != insertedKey {
+	if v, ok := cache.Peek(insertedKey); !ok || v.Data != insertedKey {
 		t.Fatalf("expected inserted key %s to remain in cache", insertedKey)
 	}
 }
@@ -454,7 +462,7 @@ func TestXLRUCache_SetEvictionOnEvictError(t *testing.T) {
 
 	var insertedKey string
 	var err error
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		insertedKey = fmt.Sprintf("key-%d", i)
 		err = cache.Set(insertedKey, &MockDataAccessor{Data: insertedKey, needSave: true})
 		if err != nil {
@@ -468,10 +476,10 @@ func TestXLRUCache_SetEvictionOnEvictError(t *testing.T) {
 	if evictedKey == "" {
 		t.Fatal("expected an eviction to happen")
 	}
-	if _, _, ok := cache.Data.Peek(evictedKey); ok {
+	if _, ok := cache.Peek(evictedKey); ok {
 		t.Fatalf("expected evicted key %s to be removed", evictedKey)
 	}
-	if v, _, ok := cache.Data.Peek(insertedKey); !ok || v.Data != insertedKey {
+	if v, ok := cache.Peek(insertedKey); !ok || v.Data != insertedKey {
 		t.Fatalf("expected inserted key %s to remain in cache", insertedKey)
 	}
 }
@@ -495,7 +503,7 @@ func TestXLRUCache_DeleteDirty(t *testing.T) {
 	if len(evicted) != 1 || evicted[0].Data != "dirty-1" {
 		t.Fatalf("expected dirty delete to evict old value, got %+v", evicted)
 	}
-	if _, _, ok := cache.Data.Peek("1"); ok {
+	if _, ok := cache.Peek("1"); ok {
 		t.Fatal("expected deleted key to be removed")
 	}
 }
@@ -516,7 +524,7 @@ func TestXLRUCache_DeleteDirtyOnEvictError(t *testing.T) {
 	if !errors.Is(err, evictErr) {
 		t.Fatalf("expected evict err, got %v", err)
 	}
-	if _, _, ok := cache.Data.Peek("1"); ok {
+	if _, ok := cache.Peek("1"); ok {
 		t.Fatal("expected deleted key to be removed even after evict failure")
 	}
 }
@@ -533,7 +541,7 @@ func TestXLRUCache_SaveAll(t *testing.T) {
 	// Leave enough per-shard headroom so random shard placement cannot evict these test keys.
 	cache := NewXLRUCache(4096, opt)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		cache.Set(fmt.Sprintf("%d", i), &MockDataAccessor{ID: i, needSave: true})
 	}
 	cache.FlushToDB(nil)
@@ -557,7 +565,7 @@ func TestXLRUCache_SaveAllBatching(t *testing.T) {
 	}
 	cache := NewXLRUCache(4096, opt)
 
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		id := strconv.Itoa(i)
 		item, err := cache.Get(id)
 		if err != nil {
@@ -582,84 +590,90 @@ func TestXLRUCache_SaveAllBatching(t *testing.T) {
 }
 
 func TestXLRUCache_SaveAllIncludesExpiredDirty(t *testing.T) {
-	var savedValues []*MockDataAccessor
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-		OnBatchSaver: func(values []*MockDataAccessor) error {
-			savedValues = append(savedValues, values...)
-			return nil
-		},
-		BatchSaveCount: 2,
-	}
-	cache := NewXLRUCache(10, opt)
+	synctest.Test(t, func(t *testing.T) {
+		var savedValues []*MockDataAccessor
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+			OnBatchSaver: func(values []*MockDataAccessor) error {
+				savedValues = append(savedValues, values...)
+				return nil
+			},
+			BatchSaveCount: 2,
+		}
+		cache := NewXLRUCache(10, opt)
 
-	if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
+		if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
 
-	time.Sleep(2100 * time.Millisecond)
-	cache.FlushToDB(nil)
+		time.Sleep(2100 * time.Millisecond)
+		cache.FlushToDB(nil)
 
-	if len(savedValues) != 1 {
-		t.Fatalf("expected 1 saved value, got %d", len(savedValues))
-	}
-	if savedValues[0].Data != "dirty-1" {
-		t.Fatalf("expected expired dirty value to be saved, got %s", savedValues[0].Data)
-	}
+		if len(savedValues) != 1 {
+			t.Fatalf("expected 1 saved value, got %d", len(savedValues))
+		}
+		if savedValues[0].Data != "dirty-1" {
+			t.Fatalf("expected expired dirty value to be saved, got %s", savedValues[0].Data)
+		}
+	})
 }
 
 func TestXLRUCache_BatchSaveIncludesExpiredDirty(t *testing.T) {
-	var savedValues []*MockDataAccessor
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-		OnBatchSaver: func(values []*MockDataAccessor) error {
-			savedValues = append(savedValues, values...)
-			return nil
-		},
-		BatchSaveCount: 1,
-	}
-	cache := NewXLRUCache(10, opt)
+	synctest.Test(t, func(t *testing.T) {
+		var savedValues []*MockDataAccessor
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+			OnBatchSaver: func(values []*MockDataAccessor) error {
+				savedValues = append(savedValues, values...)
+				return nil
+			},
+			BatchSaveCount: 1,
+		}
+		cache := NewXLRUCache(10, opt)
 
-	if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
+		if err := cache.Set("1", &MockDataAccessor{ID: 1, Data: "dirty-1", needSave: true}); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
 
-	time.Sleep(2100 * time.Millisecond)
-	cache.BatchSave()
+		time.Sleep(2100 * time.Millisecond)
+		cache.BatchSave()
 
-	if len(savedValues) != 1 {
-		t.Fatalf("expected 1 saved value, got %d", len(savedValues))
-	}
-	if savedValues[0].Data != "dirty-1" {
-		t.Fatalf("expected expired dirty value to be batch saved, got %s", savedValues[0].Data)
-	}
+		if len(savedValues) != 1 {
+			t.Fatalf("expected 1 saved value, got %d", len(savedValues))
+		}
+		if savedValues[0].Data != "dirty-1" {
+			t.Fatalf("expected expired dirty value to be batch saved, got %s", savedValues[0].Data)
+		}
+	})
 }
 
 func TestXLRUCache_BatchSaveLargeIncludesExpiredDirty(t *testing.T) {
-	var savedValues []*MockDataAccessor
-	opt := Option[string, *MockDataAccessor]{
-		TTL: 1000 * time.Millisecond,
-		OnBatchSaver: func(values []*MockDataAccessor) error {
-			savedValues = append(savedValues, values...)
-			return nil
-		},
-		BatchSaveCount: 1,
-	}
-	cache := NewXLRUCache(50, opt)
-
-	for i := 0; i < 11; i++ {
-		key := fmt.Sprintf("%d", i)
-		if err := cache.Set(key, &MockDataAccessor{ID: i, Data: key, needSave: true}); err != nil {
-			t.Fatalf("expected no error, got %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		var savedValues []*MockDataAccessor
+		opt := Option[string, *MockDataAccessor]{
+			TTL: 1000 * time.Millisecond,
+			OnBatchSaver: func(values []*MockDataAccessor) error {
+				savedValues = append(savedValues, values...)
+				return nil
+			},
+			BatchSaveCount: 1,
 		}
-	}
+		cache := NewXLRUCache(50, opt)
 
-	time.Sleep(2100 * time.Millisecond)
-	cache.BatchSave()
+		for i := range 11 {
+			key := fmt.Sprintf("%d", i)
+			if err := cache.Set(key, &MockDataAccessor{ID: i, Data: key, needSave: true}); err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+		}
 
-	if len(savedValues) == 0 {
-		t.Fatal("expected large-path BatchSave to flush at least one expired dirty value")
-	}
+		time.Sleep(2100 * time.Millisecond)
+		cache.BatchSave()
+
+		if len(savedValues) == 0 {
+			t.Fatal("expected large-path BatchSave to flush at least one expired dirty value")
+		}
+	})
 }
 
 func TestXLRUCache_FlushToDBLargeScaleUnique(t *testing.T) {
@@ -679,7 +693,7 @@ func TestXLRUCache_FlushToDBLargeScaleUnique(t *testing.T) {
 	}
 	cache := NewXLRUCache(cacheSize, opt)
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		key := strconv.Itoa(i)
 		if err := cache.Set(key, &MockDataAccessor{ID: i, Data: key, needSave: true}); err != nil {
 			t.Fatalf("expected set(%s) to succeed, got %v", key, err)
@@ -796,9 +810,9 @@ func TestXLRUCache_Stats(t *testing.T) {
 }
 
 func TestLocalCacheRoundTrip(t *testing.T) {
-	var loaderCount int32
+	var loaderCount atomic.Int32
 	cache := NewLocalCache[string, string](10, false, time.Minute, func(key string) (string, error) {
-		atomic.AddInt32(&loaderCount, 1)
+		loaderCount.Add(1)
 		return "loaded-" + key, nil
 	})
 
@@ -829,22 +843,8 @@ func TestLocalCacheRoundTrip(t *testing.T) {
 	if err != nil || v != "loaded-a" {
 		t.Fatalf("expected loader-backed value after delete, got value=%v err=%v", v, err)
 	}
-	if atomic.LoadInt32(&loaderCount) != 2 {
-		t.Fatalf("expected loader to run twice, got %d", loaderCount)
-	}
-}
-
-func TestDataAccessorHelper(t *testing.T) {
-	helper := &LocalCacheDataHelper[string]{data: "test"}
-	if helper.NeedSave() {
-		t.Error("expected NeedSave to be false")
-	}
-	helper.SetNeedSave(true)
-	if helper.NeedSave() {
-		t.Error("expected SetNeedSave to remain a no-op")
-	}
-	if helper.Data() != "test" {
-		t.Errorf("expected helper data to remain unchanged")
+	if loaderCount.Load() != 2 {
+		t.Fatalf("expected loader to run twice, got %d", loaderCount.Load())
 	}
 }
 
@@ -881,14 +881,14 @@ func (m *MongoTestData) SaveDoc() bson.M {
 func TestXLRUCache_WithMongo(t *testing.T) {
 	_, coll := newMongoCollection(t, "test_xlru")
 
-	var loaderCount int32
-	var saverCount int32
+	var loaderCount atomic.Int32
+	var saverCount atomic.Int32
 
 	opt := Option[string, *MongoTestData]{
 		OnLoader: func(key string) (*MongoTestData, error) {
-			atomic.AddInt32(&loaderCount, 1)
+			loaderCount.Add(1)
 			data := &MongoTestData{ID: key}
-			err := coll.FindOne(context.Background(), bson.M{"_id": key}).Decode(data)
+			err := coll.FindOne(t.Context(), bson.M{"_id": key}).Decode(data)
 			if err != nil {
 				if err == mongo.ErrNoDocuments {
 					// Create a new one if not found
@@ -901,7 +901,7 @@ func TestXLRUCache_WithMongo(t *testing.T) {
 			return data, nil
 		},
 		OnBatchSaver: func(values []*MongoTestData) error {
-			atomic.AddInt32(&saverCount, int32(len(values)))
+			saverCount.Add(int32(len(values)))
 			models := make([]mongo.WriteModel, 0, len(values))
 			for _, v := range values {
 				if v.NeedSave() {
@@ -915,7 +915,7 @@ func TestXLRUCache_WithMongo(t *testing.T) {
 			if len(models) == 0 {
 				return nil
 			}
-			_, err := coll.BulkWrite(context.Background(), models)
+			_, err := coll.BulkWrite(t.Context(), models)
 			return err
 		},
 		BatchSaveCount: 2,
@@ -930,8 +930,8 @@ func TestXLRUCache_WithMongo(t *testing.T) {
 	if item1.Data != "loaded-1" {
 		t.Errorf("expected data 'loaded-1', got '%s'", item1.Data)
 	}
-	if atomic.LoadInt32(&loaderCount) != 1 {
-		t.Errorf("expected loader to be called once, got %d", loaderCount)
+	if loaderCount.Load() != 1 {
+		t.Errorf("expected loader to be called once, got %d", loaderCount.Load())
 	}
 
 	// 2. Modify the item
@@ -950,7 +950,7 @@ func TestXLRUCache_WithMongo(t *testing.T) {
 
 	// 5. Verify data in MongoDB
 	var result MongoTestData
-	err = coll.FindOne(context.Background(), bson.M{"_id": "1"}).Decode(&result)
+	err = coll.FindOne(t.Context(), bson.M{"_id": "1"}).Decode(&result)
 	if err != nil {
 		t.Fatalf("failed to find item 1 in mongo: %v", err)
 	}
@@ -958,7 +958,7 @@ func TestXLRUCache_WithMongo(t *testing.T) {
 		t.Errorf("expected data 'modified-1' in mongo, got '%s'", result.Data)
 	}
 
-	err = coll.FindOne(context.Background(), bson.M{"_id": "2"}).Decode(&result)
+	err = coll.FindOne(t.Context(), bson.M{"_id": "2"}).Decode(&result)
 	if err != nil {
 		t.Fatalf("failed to find item 2 in mongo: %v", err)
 	}
@@ -966,7 +966,7 @@ func TestXLRUCache_WithMongo(t *testing.T) {
 		t.Errorf("expected data 'loaded-2' in mongo, got '%s'", result.Data)
 	}
 
-	if atomic.LoadInt32(&saverCount) != 2 {
-		t.Errorf("expected saver to be called with 2 items, got %d", atomic.LoadInt32(&saverCount))
+	if saverCount.Load() != 2 {
+		t.Errorf("expected saver to be called with 2 items, got %d", saverCount.Load())
 	}
 }

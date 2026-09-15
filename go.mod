@@ -1,11 +1,8 @@
 module github.com/placeholder/xlru
 
-go 1.26.0
+go 1.27.0
 
 require (
-	github.com/bluele/gcache v0.0.2
-	github.com/phuslu/lru v1.0.22
-	github.com/phuslu/shardmap v0.0.0-20230929024548-c0f3d8a4fccd
 	go.mongodb.org/mongo-driver/v2 v2.5.0
 	golang.org/x/sync v0.19.0
 )
@@ -19,5 +16,3 @@ require (
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
 )
-
-replace github.com/phuslu/lru => github.com/yeqiaojun/lru v1.0.22
